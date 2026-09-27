@@ -34,6 +34,7 @@ def init_db():
             observaciones TEXT
         )
     ''')
+    cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_mediciones_fecha_hora ON mediciones (fecha_hora)')
     conn.commit()
     conn.close()
 
@@ -60,6 +61,58 @@ def obtener_mediciones():
     conn.close()
     return df
 
+def importar_excel(ruta_excel):
+    """
+    Importa la hoja Justo del Excel y evita duplicados por fecha y hora.
+    Retorna la cantidad de registros nuevos y filas omitidas.
+    """
+    columnas = {
+        "Fecha": "fecha",
+        "Hora": "hora",
+        "Sistólica": "sistolica",
+        "Diastólica": "diastolica",
+        "Pulsaciones": "pulsaciones",
+        "SpO2": "spo2",
+        "Peso": "peso",
+        "OBSERVACIONES ": "observaciones",
+    }
+    df = pd.read_excel(ruta_excel, sheet_name="Justo")
+    faltantes = set(columnas) - set(df.columns)
+    if faltantes:
+        raise ValueError(f"Faltan columnas requeridas: {', '.join(sorted(faltantes))}")
+
+    df = df.rename(columns=columnas)
+    df["fecha_hora"] = pd.to_datetime(
+        df["fecha"].astype(str) + " " + df["hora"].astype(str), errors="coerce"
+    )
+    requeridas = ["fecha_hora", "sistolica", "diastolica", "pulsaciones"]
+    filas_omitidas = int(df[requeridas].isna().any(axis=1).sum())
+    df = df.dropna(subset=requeridas)
+
+    registros = []
+    for fila in df.itertuples(index=False):
+        registros.append((
+            fila.fecha_hora.strftime("%Y-%m-%d %H:%M:%S"),
+            int(fila.sistolica),
+            int(fila.diastolica),
+            int(fila.pulsaciones),
+            None if pd.isna(fila.spo2) else int(fila.spo2),
+            None if pd.isna(fila.peso) else float(fila.peso),
+            None if pd.isna(fila.observaciones) else str(fila.observaciones),
+        ))
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.executemany('''
+        INSERT OR IGNORE INTO mediciones
+        (fecha_hora, sistolica, diastolica, pulsaciones, spo2, peso, observaciones)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', registros)
+    nuevos = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return nuevos, filas_omitidas
+
 # ==============================================================================
 # 2. INTERFAZ DE USUARIO (Streamlit)
 # ==============================================================================
@@ -83,6 +136,21 @@ def main():
     # --------------------------------------------------------------------------
     with tab1:
         st.header("Nueva Medición")
+
+        archivo_excel = st.file_uploader(
+            "Importar registros desde Excel",
+            type=["xlsx"],
+            help="Selecciona la hoja Justo de tu archivo Corazón.xlsx.",
+        )
+        if archivo_excel is not None and st.button("Importar datos", type="primary"):
+            try:
+                nuevos, omitidos = importar_excel(archivo_excel)
+                st.success(f"Importación completada: {nuevos} registros nuevos.")
+                if omitidos:
+                    st.warning(f"Se omitieron {omitidos} filas incompletas.")
+                st.rerun()
+            except (ValueError, KeyError) as error:
+                st.error(f"No se pudo importar el archivo: {error}")
         
         with st.form("form_medicion"):
             # Campos de entrada organizados en columnas
